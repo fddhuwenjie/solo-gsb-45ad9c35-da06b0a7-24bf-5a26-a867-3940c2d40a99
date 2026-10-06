@@ -68,6 +68,26 @@ CREATE TABLE IF NOT EXISTS finals (
     reviewer2_label TEXT NOT NULL,
     PRIMARY KEY (batch_id, code)
 );
+
+-- Post-seal errata. Revision 0 is the sealed original (no row here); each
+-- accepted erratum appends exactly one row with the next revision number.
+CREATE TABLE IF NOT EXISTS errata (
+    batch_id   TEXT NOT NULL REFERENCES batches(id),
+    revision   INTEGER NOT NULL CHECK (revision >= 1),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (batch_id, revision)
+);
+
+-- Per-sample truth replacement carried by one errata revision.
+CREATE TABLE IF NOT EXISTS errata_items (
+    batch_id       TEXT NOT NULL,
+    revision       INTEGER NOT NULL,
+    code           TEXT NOT NULL,
+    old_true_label TEXT NOT NULL,  -- truth at the previous revision
+    new_true_label TEXT NOT NULL,
+    PRIMARY KEY (batch_id, revision, code),
+    FOREIGN KEY (batch_id, revision) REFERENCES errata (batch_id, revision)
+);
 """
 
 
