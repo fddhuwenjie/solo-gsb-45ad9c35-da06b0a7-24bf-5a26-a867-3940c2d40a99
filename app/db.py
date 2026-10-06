@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS adjudications (
 );
 
 -- Final, immutable per-sample outcome, written exactly once at seal time.
+-- Errata never touch this table: version 0 always reproduces from it.
 CREATE TABLE IF NOT EXISTS finals (
     batch_id        TEXT NOT NULL REFERENCES batches(id),
     position        INTEGER NOT NULL,
@@ -67,6 +68,26 @@ CREATE TABLE IF NOT EXISTS finals (
     reviewer1_label TEXT NOT NULL,
     reviewer2_label TEXT NOT NULL,
     PRIMARY KEY (batch_id, code)
+);
+
+-- Post-seal truth corrections. Version 0 is the sealed original (the
+-- ``finals`` rows); every successful erratum appends one strictly increasing
+-- version. Append-only: old versions are never rewritten or deleted.
+CREATE TABLE IF NOT EXISTS errata_versions (
+    batch_id   TEXT NOT NULL REFERENCES batches(id),
+    version    INTEGER NOT NULL CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (batch_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS errata_items (
+    batch_id       TEXT NOT NULL,
+    version        INTEGER NOT NULL,
+    code           TEXT NOT NULL,
+    old_true_label TEXT NOT NULL,
+    new_true_label TEXT NOT NULL,
+    PRIMARY KEY (batch_id, version, code),
+    FOREIGN KEY (batch_id, version) REFERENCES errata_versions(batch_id, version)
 );
 """
 

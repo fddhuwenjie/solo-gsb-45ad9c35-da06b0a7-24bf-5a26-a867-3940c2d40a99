@@ -43,5 +43,37 @@ curl -sS -X POST "$BASE/batches/$BID/adjudications" \
   -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
   -d '{"decisions": {"S03": "bird"}}' | python3 -m json.tool
 
-echo "== 7. unblinded results =="
+echo "== 7. unblinded results (version 0: the sealed original) =="
+curl -sS "$BASE/batches/$BID/results" | python3 -m json.tool
+
+echo "== 8. issue errata v1: S01's recorded truth 'cat' is actually 'dog' =="
+curl -sS -X POST "$BASE/batches/$BID/errata" \
+  -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0, "corrections": [{"code": "S01", "true_label": "dog"}]}' \
+  | python3 -m json.tool
+
+echo "== 9. a stale request (expected_revision 0) is rejected with the current revision =="
+curl -sS -o /dev/stderr -w 'HTTP %{http_code}\n' -X POST "$BASE/batches/$BID/errata" \
+  -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0, "corrections": [{"code": "S02", "true_label": "cat"}]}'
+
+echo "== 10. retry with revision 1; correct two samples at once -> v2 =="
+curl -sS -X POST "$BASE/batches/$BID/errata" \
+  -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "corrections": [
+        {"code": "S02", "true_label": "cat"},
+        {"code": "S03", "true_label": "dog"}
+      ]}' | python3 -m json.tool
+
+echo "== 11. query by version (v0 / v1 / v2) =="
+for V in 0 1 2; do
+  echo "-- version $V --"
+  curl -sS "$BASE/batches/$BID/errata/$V" \
+    | python3 -c "import sys, json; d=json.load(sys.stdin); print('version:', d['version'], 'summary:', d['summary'], 'corrected:', d['corrected_samples'])"
+done
+
+echo "== 12. list every version =="
+curl -sS "$BASE/batches/$BID/errata" | python3 -m json.tool
+
+echo "== 13. the original results query still returns the sealed original =="
 curl -sS "$BASE/batches/$BID/results" | python3 -m json.tool

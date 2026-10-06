@@ -18,6 +18,12 @@ Workflow
 5. Sealing unblinds the batch: results expose per-sample final label, true
    label and each reviewer's correct count. Final rows are written once at
    seal time and never change afterwards.
+6. After sealing the arbiter may issue append-only errata that correct wrong
+   true labels (``POST .../errata``). Version 0 is the sealed original; each
+   accepted erratum becomes one new version and replaces only the named
+   samples' true labels. Submissions and adjudications stay immutable, and
+   the original batch/results queries keep returning the version-0 payload.
+   Per-version results are available via ``GET .../errata/{version}``.
 """
 
 from __future__ import annotations
@@ -61,6 +67,18 @@ class SubmissionRequest(BaseModel):
 class AdjudicationRequest(BaseModel):
     # maps disagreement sample code -> chosen label (one of the two reviewers')
     decisions: dict[str, str]
+
+
+class CorrectionSpec(BaseModel):
+    code: str
+    true_label: str
+
+
+class ErrataRequest(BaseModel):
+    # expected current revision (version 0 right after sealing); the erratum
+    # applies only if it still matches
+    expected_revision: int
+    corrections: list[CorrectionSpec]
 
 
 # --------------------------------------------------------------------------
@@ -451,6 +469,273 @@ def logic_results(store: Store, batch_id: str) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Post-seal errata (unblinding corrections, versioned)
+# --------------------------------------------------------------------------
+
+def _current_revision(conn, batch_id: str) -> int:
+    """Largest errata version for the batch; 0 when only the seal exists."""
+    return conn.execute(
+        "SELECT COALESCE(MAX(version), 0) AS v FROM errata_versions WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchone()["v"]
+
+
+def _effective_true_labels(conn, batch_id: str, upto_version: int) -> dict[str, str]:
+    """True label per sample as of ``upto_version`` (0 == sealed original)."""
+    truth = {
+        r["code"]: r["true_label"]
+        for r in conn.execute(
+            "SELECT code, true_label FROM finals WHERE batch_id = ?", (batch_id,)
+        )
+    }
+    if upto_version >= 1:
+        items = conn.execute(
+            "SELECT version, code, new_true_label FROM errata_items"
+            " WHERE batch_id = ? AND version <= ? ORDER BY version",
+            (batch_id, upto_version),
+        ).fetchall()
+        for r in items:
+            truth[r["code"]] = r["new_true_label"]
+    return truth
+
+
+def _errata_version_payload(conn, batch, version: int) -> dict:
+    """Recompute results for one erratum version.
+
+    Every classification (final label and both reviewer labels) comes straight
+    from the immutable sealed rows; only the true labels are layered with the
+    corrections of versions 1..``version`` before correctness is recomputed.
+    """
+    batch_id = batch["id"]
+    current = _current_revision(conn, batch_id)
+    if version < 0 or version > current:
+        raise HTTPException(
+            404,
+            {"detail": f"errata version {version} not found", "current_revision": current},
+        )
+
+    rows = conn.execute(
+        "SELECT position, code, final_label, true_label, reviewer1_label, reviewer2_label"
+        " FROM finals WHERE batch_id = ? ORDER BY position",
+        (batch_id,),
+    ).fetchall()
+    truth = _effective_true_labels(conn, batch_id, version)
+
+    results = []
+    r1_correct = r2_correct = final_correct = 0
+    disagreement_count = 0
+    for r in rows:
+        true_label = truth[r["code"]]
+        ok1 = r["reviewer1_label"] == true_label
+        ok2 = r["reviewer2_label"] == true_label
+        okf = r["final_label"] == true_label
+        agreed = r["reviewer1_label"] == r["reviewer2_label"]
+        disagreement_count += not agreed
+        r1_correct += ok1
+        r2_correct += ok2
+        final_correct += okf
+        results.append(
+            {
+                "code": r["code"],
+                "final_label": r["final_label"],
+                "true_label": true_label,
+                "reviewer1_label": r["reviewer1_label"],
+                "reviewer2_label": r["reviewer2_label"],
+                "agreed": agreed,
+                "reviewer1_correct": ok1,
+                "reviewer2_correct": ok2,
+                "final_correct": okf,
+            }
+        )
+
+    if version == 0:
+        created_at = batch["sealed_at"]
+        corrected_samples = []
+    else:
+        created_at = conn.execute(
+            "SELECT created_at FROM errata_versions WHERE batch_id = ? AND version = ?",
+            (batch_id, version),
+        ).fetchone()["created_at"]
+        corrected_samples = [
+            {
+                "code": r["code"],
+                "old_true_label": r["old_true_label"],
+                "new_true_label": r["new_true_label"],
+            }
+            for r in conn.execute(
+                """
+                SELECT e.code AS code, e.old_true_label AS old_true_label,
+                       e.new_true_label AS new_true_label
+                FROM errata_items e
+                JOIN finals f ON f.batch_id = e.batch_id AND f.code = e.code
+                WHERE e.batch_id = ? AND e.version = ?
+                ORDER BY f.position
+                """,
+                (batch_id, version),
+            ).fetchall()
+        ]
+
+    return {
+        "batch_id": batch_id,
+        "phase": "sealed",
+        "version": version,
+        "current_revision": current,
+        "created_at": created_at,
+        "sealed_at": batch["sealed_at"],
+        "allowed_categories": json.loads(batch["allowed_categories"]),
+        "results": results,
+        "summary": {
+            "sample_count": len(results),
+            "disagreement_count": disagreement_count,
+            "reviewer1_correct": r1_correct,
+            "reviewer2_correct": r2_correct,
+            "final_correct": final_correct,
+        },
+        "corrected_samples": corrected_samples,
+    }
+
+
+def logic_submit_errata(
+    store: Store, batch_id: str, token: str | None, payload: ErrataRequest
+) -> dict:
+    with store.write() as conn:
+        batch = _get_batch(conn, batch_id)
+        # Only the arbiter may issue errata; reviewer credentials are rejected.
+        _require_arbiter(batch, token)
+        if batch["phase"] != "sealed":
+            raise HTTPException(
+                409, f"batch is {batch['phase']}; errata are accepted only after sealing"
+            )
+        if payload.expected_revision < 0:
+            raise HTTPException(422, "expected_revision must be a non-negative integer")
+
+        # Whole-request structural validation: no code may appear twice.
+        corrections = payload.corrections
+        if not corrections:
+            raise HTTPException(422, "corrections must not be empty")
+        seen: set[str] = set()
+        duplicated: list[str] = []
+        for c in corrections:
+            if c.code in seen and c.code not in duplicated:
+                duplicated.append(c.code)
+            seen.add(c.code)
+        if duplicated:
+            raise HTTPException(
+                422, {"detail": "sample codes must not repeat within one request", "duplicated": duplicated}
+            )
+
+        finals_rows = conn.execute(
+            "SELECT code FROM finals WHERE batch_id = ?", (batch_id,)
+        ).fetchall()
+        known = {r["code"] for r in finals_rows}
+        unknown = sorted({c.code for c in corrections} - known)
+        if unknown:
+            raise HTTPException(
+                422, {"detail": "corrections must only reference samples of this batch", "unknown": unknown}
+            )
+        categories = set(json.loads(batch["allowed_categories"]))
+        invalid = {c.code: c.true_label for c in corrections if c.true_label not in categories}
+        if invalid:
+            raise HTTPException(
+                422, {"detail": "every true_label must be one of allowed_categories", "invalid": invalid}
+            )
+
+        current = _current_revision(conn, batch_id)
+        if payload.expected_revision != current:
+            # Stale (or future) revision: report the revision the caller must
+            # retry with; nothing is written.
+            raise HTTPException(
+                409,
+                {
+                    "detail": "expected_revision does not match the current revision",
+                    "current_revision": current,
+                },
+            )
+
+        truth = _effective_true_labels(conn, batch_id, current)
+        noop = [c.code for c in corrections if c.true_label == truth[c.code]]
+        if noop:
+            raise HTTPException(
+                422,
+                {
+                    "detail": "every correction must change the current true label",
+                    "without_change": noop,
+                },
+            )
+
+        new_version = current + 1
+        conn.execute(
+            "INSERT INTO errata_versions (batch_id, version, created_at) VALUES (?,?,?)",
+            (batch_id, new_version, _now()),
+        )
+        conn.executemany(
+            "INSERT INTO errata_items (batch_id, version, code, old_true_label, new_true_label)"
+            " VALUES (?,?,?,?,?)",
+            [
+                (batch_id, new_version, c.code, truth[c.code], c.true_label)
+                for c in corrections
+            ],
+        )
+        return _errata_version_payload(conn, batch, new_version)
+
+
+def logic_errata_version(store: Store, batch_id: str, version: int) -> dict:
+    with store.read() as conn:
+        batch = _get_batch(conn, batch_id)
+        if batch["phase"] != "sealed":
+            raise HTTPException(
+                409, f"batch is {batch['phase']}; errata exist only after sealing"
+            )
+        return _errata_version_payload(conn, batch, version)
+
+
+def logic_errata_index(store: Store, batch_id: str) -> dict:
+    with store.read() as conn:
+        batch = _get_batch(conn, batch_id)
+        if batch["phase"] != "sealed":
+            raise HTTPException(
+                409, f"batch is {batch['phase']}; errata exist only after sealing"
+            )
+        batch_id = batch["id"]
+        current = _current_revision(conn, batch_id)
+        versions = [
+            {
+                "version": 0,
+                "created_at": batch["sealed_at"],
+                "correction_count": 0,
+                "corrected_samples": [],
+            }
+        ]
+        for v in conn.execute(
+            "SELECT version, created_at FROM errata_versions WHERE batch_id = ? ORDER BY version",
+            (batch_id,),
+        ).fetchall():
+            samples = [
+                {"code": r["code"], "old_true_label": r["old_true_label"], "new_true_label": r["new_true_label"]}
+                for r in conn.execute(
+                    """
+                    SELECT e.code AS code, e.old_true_label AS old_true_label,
+                           e.new_true_label AS new_true_label
+                    FROM errata_items e
+                    JOIN finals f ON f.batch_id = e.batch_id AND f.code = e.code
+                    WHERE e.batch_id = ? AND e.version = ?
+                    ORDER BY f.position
+                    """,
+                    (batch_id, v["version"]),
+                ).fetchall()
+            ]
+            versions.append(
+                {
+                    "version": v["version"],
+                    "created_at": v["created_at"],
+                    "correction_count": len(samples),
+                    "corrected_samples": samples,
+                }
+            )
+        return {"batch_id": batch_id, "current_revision": current, "versions": versions}
+
+
+# --------------------------------------------------------------------------
 # HTTP layer
 # --------------------------------------------------------------------------
 
@@ -507,6 +792,22 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/batches/{batch_id}/results")
     def get_results(batch_id: str):
         return logic_results(store, batch_id)
+
+    @app.post("/batches/{batch_id}/errata", status_code=201)
+    def submit_errata(
+        batch_id: str,
+        payload: ErrataRequest,
+        x_arbiter_token: str | None = Header(default=None),
+    ):
+        return logic_submit_errata(store, batch_id, x_arbiter_token, payload)
+
+    @app.get("/batches/{batch_id}/errata")
+    def list_errata(batch_id: str):
+        return logic_errata_index(store, batch_id)
+
+    @app.get("/batches/{batch_id}/errata/{version}")
+    def get_errata_version(batch_id: str, version: int):
+        return logic_errata_version(store, batch_id, version)
 
     return app
 
